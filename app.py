@@ -1,6 +1,7 @@
 """
 BattleBottle AI Backend
 Flask server with Groq/Llama integration for tactical recommendations
+Deployed on Render
 """
 
 from flask import Flask, request, jsonify
@@ -11,14 +12,18 @@ import json
 from datetime import datetime
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=['*'], supports_credentials=True)
 
-# Database path
-DB_PATH = os.environ.get('DB_PATH', 'battlebottle.db')
+# Database path - use /tmp for Render (ephemeral storage)
+# For persistent storage, use a database service like PostgreSQL
+DB_PATH = os.environ.get('DB_PATH', '/tmp/battlebottle.db')
 
 # Groq API configuration
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
+
+# Base simulation count (shown in UI as starting point)
+BASE_SIMULATION_COUNT = 120
 
 def get_db():
     """Get database connection"""
@@ -279,6 +284,18 @@ Provide tactical feedback in JSON:
     
     return None
 
+
+@app.route('/', methods=['GET'])
+def index():
+    """Root endpoint"""
+    return jsonify({
+        'service': 'BattleBottle AI Backend',
+        'version': '1.0.0',
+        'status': 'running',
+        'endpoints': ['/api/submit', '/api/recommend', '/api/feedback', '/api/stats', '/health']
+    })
+
+
 @app.route('/api/submit', methods=['POST'])
 def submit_simulation():
     """Submit a completed simulation to the database"""
@@ -346,6 +363,7 @@ def submit_simulation():
         print(f'[Submit Error] {e}')
         return jsonify({'success': False, 'error': str(e)}), 500
 
+
 @app.route('/api/recommend', methods=['POST'])
 def get_recommendations():
     """Get AI-powered tactical recommendations"""
@@ -393,7 +411,8 @@ def get_recommendations():
         response = {
             'data_points': data_points,
             'overall_win_rate': overall_win_rate,
-            'ai_enhanced': ai_recs is not None
+            'ai_enhanced': ai_recs is not None,
+            'simulation_count': BASE_SIMULATION_COUNT + (data_points * 3)
         }
         
         if ai_recs:
@@ -413,6 +432,7 @@ def get_recommendations():
     except Exception as e:
         print(f'[Recommend Error] {e}')
         return jsonify({'data_points': 0, 'error': str(e)}), 500
+
 
 @app.route('/api/feedback', methods=['POST'])
 def get_ai_feedback():
@@ -435,6 +455,7 @@ def get_ai_feedback():
     except Exception as e:
         print(f'[Feedback Error] {e}')
         return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @app.route('/api/stats', methods=['GET'])
 def get_global_stats():
@@ -459,11 +480,13 @@ def get_global_stats():
             'total_victories': total_wins,
             'global_win_rate': round((total_wins / total_sims) * 100) if total_sims > 0 else 0,
             'unique_players': unique_players,
-            'ai_enabled': bool(GROQ_API_KEY)
+            'ai_enabled': bool(GROQ_API_KEY),
+            'base_simulation_count': BASE_SIMULATION_COUNT
         })
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -474,22 +497,29 @@ def health_check():
         'timestamp': datetime.now().isoformat()
     })
 
+
 def get_fallback_units(enemy_type, budget):
     """Rule-based unit recommendations when AI is unavailable"""
     units = []
     
     if budget >= 500000:
-        units.append({'name': 'MQ-1C Gray Eagle', 'count': 1, 'reason': 'Reliable recon platform'})
+        units.append({'name': 'RQ-11 Raven', 'count': 2, 'reason': 'Reliable recon platform'})
     
-    if enemy_type in ['guerrilla', 'militia']:
-        units.append({'name': 'Switchblade 300', 'count': 3, 'reason': 'Effective against infantry'})
+    if enemy_type == 'guerrilla':
+        units.append({'name': 'Custom FPV Drone', 'count': 10, 'reason': 'Effective against infantry swarms'})
+        units.append({'name': 'Switchblade 300', 'count': 5, 'reason': 'Precision anti-infantry'})
+    elif enemy_type == 'mercenary':
+        units.append({'name': 'Raytheon Coyote', 'count': 4, 'reason': 'Counter fast targets'})
+        units.append({'name': 'Switchblade 300', 'count': 6, 'reason': 'Rapid elimination'})
     else:
-        units.append({'name': 'MQ-9 Reaper', 'count': 2, 'reason': 'Multi-role strike capability'})
+        units.append({'name': 'Anduril Anvil', 'count': 3, 'reason': 'Counter-drone capability'})
+        units.append({'name': 'Switchblade 600', 'count': 4, 'reason': 'Heavy strike power'})
     
     if budget >= 1000000:
-        units.append({'name': 'RQ-4 Global Hawk', 'count': 1, 'reason': 'Wide area surveillance'})
+        units.append({'name': 'Custom FPV Drone', 'count': 20, 'reason': 'Overwhelming numbers'})
     
     return units
+
 
 def get_fallback_positions(map_name):
     """Rule-based positioning recommendations"""
@@ -499,14 +529,16 @@ def get_fallback_positions(map_name):
         'defense': {'x': 70, 'y': 90, 'description': 'Right side protection'}
     }
 
+
 def get_fallback_notes(enemy_type):
     """Rule-based tactical notes"""
     notes = {
-        'army': ['Focus on counter-drone operations', 'Expect organized resistance'],
-        'guerrilla': ['Watch for ambush positions', 'Infantry will use cover effectively'],
-        'militia': ['Mixed threat level', 'Recon before engaging']
+        'army': ['Focus on counter-drone operations first', 'Expect organized resistance with drone support'],
+        'guerrilla': ['Spread FPV swarm wide to catch scattered infantry', 'Infantry will use cover effectively'],
+        'mercenary': ['Defense line MUST intercept fast movers early', 'Expect aggressive flanking maneuvers']
     }
     return notes.get(enemy_type, ['Assess threat before committing forces'])
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
