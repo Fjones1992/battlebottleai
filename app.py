@@ -359,8 +359,10 @@ def get_recommendations():
 def build_recommendations(map_id, enemy_type, budget, patterns, stats, winning_units, positions):
     """Build structured recommendations from the data."""
     
-    # Parse winning compositions
+    # Parse winning compositions and count specific units
     unit_counts = defaultdict(list)
+    specific_unit_counts = defaultdict(int)
+    
     if patterns:
         for pattern in patterns:
             if pattern['unit_composition']:
@@ -370,6 +372,7 @@ def build_recommendations(map_id, enemy_type, budget, patterns, stats, winning_u
                     if len(parts) == 2:
                         cat, name = parts
                         unit_counts[cat].append(name)
+                        specific_unit_counts[name] += 1
     
     # Calculate recommended composition
     recon_count = len([u for u in unit_counts.get('recon', [])])
@@ -391,7 +394,7 @@ def build_recommendations(map_id, enemy_type, budget, patterns, stats, winning_u
         rec_defense = 1 if enemy_type == 'army' else 0
         rec_equip = 1
     
-    # Get specific unit recommendations
+    # Get specific unit recommendations with counts
     recommended_units = []
     if winning_units:
         for unit in winning_units[:6]:
@@ -400,18 +403,57 @@ def build_recommendations(map_id, enemy_type, budget, patterns, stats, winning_u
                 'category': unit['unit_category'],
                 'cost': unit['unit_cost'],
                 'win_rate': round(unit['survival_rate'] * 100, 1),
-                'avg_kills': round(unit['avg_kills'], 1)
+                'avg_kills': round(unit['avg_kills'], 1),
+                'times_used': specific_unit_counts.get(unit['unit_name'], 1)
             })
     
-    # Get position recommendations
+    # Build specific unit deployment list (e.g., "2x Switchblade 300")
+    unit_deploy_list = []
+    seen_units = set()
+    for unit in recommended_units:
+        if unit['name'] not in seen_units:
+            count = max(1, round(unit['times_used'] / max(1, stats['total_sims'] if stats else 1) * 2))
+            if count > 0:
+                unit_deploy_list.append({
+                    'name': unit['name'],
+                    'count': count,
+                    'category': unit['category'],
+                    'cost': unit['cost']
+                })
+                seen_units.add(unit['name'])
+    
+    # Sort by category order: recon first, then attack, defense, equip
+    cat_order = {'recon': 0, 'attack': 1, 'defense': 2, 'equip': 3}
+    unit_deploy_list.sort(key=lambda x: cat_order.get(x['category'], 99))
+    
+    # Get position recommendations with descriptive locations
     position_recs = {}
     if positions:
         for pos in positions:
+            x = round(pos['avg_x'], 1)
+            y = round(pos['avg_y'], 1)
+            
+            # Convert coordinates to descriptive positions
+            x_desc = 'left flank' if x < 35 else 'right flank' if x > 65 else 'center'
+            y_desc = 'forward' if y < 70 else 'rear' if y > 85 else 'mid-field'
+            
             position_recs[pos['unit_category']] = {
-                'x': round(pos['avg_x'], 1),
-                'y': round(pos['avg_y'], 1),
+                'x': x,
+                'y': y,
+                'description': f"{x_desc}, {y_desc}",
                 'sample_size': pos['sample_size']
             }
+    
+    # Add default positions if missing
+    default_positions = {
+        'recon': {'x': 50, 'y': 80, 'description': 'center, rear'},
+        'attack': {'x': 50, 'y': 88, 'description': 'center, deployment zone'},
+        'defense': {'x': 50, 'y': 85, 'description': 'center, mid-field'},
+        'equip': {'x': 50, 'y': 95, 'description': 'center, rear safe zone'}
+    }
+    for cat, pos in default_positions.items():
+        if cat not in position_recs:
+            position_recs[cat] = {**pos, 'sample_size': 0}
     
     # Calculate confidence based on data volume
     total_sims = stats['total_sims'] if stats and stats['total_sims'] else 0
@@ -420,6 +462,9 @@ def build_recommendations(map_id, enemy_type, budget, patterns, stats, winning_u
     win_rate = 0
     if stats and stats['total_sims'] and stats['victories']:
         win_rate = round(stats['victories'] / stats['total_sims'] * 100, 1)
+    
+    # Build human-readable deployment string
+    deploy_str = ', '.join([f"{u['count']}x {u['name']}" for u in unit_deploy_list[:4]])
     
     return {
         'scenario': {
@@ -437,6 +482,8 @@ def build_recommendations(map_id, enemy_type, budget, patterns, stats, winning_u
             'equipment': rec_equip,
             'explanation': f"Based on {total_sims} simulations, deploy {rec_recon} recon, {rec_attack} attack, {rec_defense} defense units."
         },
+        'specific_units': unit_deploy_list[:5],
+        'deploy_summary': deploy_str if deploy_str else None,
         'top_units': recommended_units,
         'deployment_zones': position_recs,
         'tactical_notes': generate_tactical_notes(map_id, enemy_type, stats)
