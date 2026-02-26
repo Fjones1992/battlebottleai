@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: battlebottle-ai
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false  # You'll set this in the Render dashboard
+      - key: DB_PATH
+        value: /data/battlebottle.db
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
+    plan: free
