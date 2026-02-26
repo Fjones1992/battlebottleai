@@ -1,677 +1,513 @@
 """
-BattleBottle AI Data Flywheel Backend
-=====================================
-Collects simulation data from players and generates tactical recommendations
-using Llama via Groq API (free tier).
-
-Deploy for free on: Render.com, Railway.app, or Vercel
+BattleBottle AI Backend
+Flask server with Groq/Llama integration for tactical recommendations
 """
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import sqlite3
-import json
 import os
+import json
 from datetime import datetime
-from collections import defaultdict
-import statistics
 
 app = Flask(__name__)
-CORS(app)  # Allow cross-origin requests from your game
+CORS(app)
 
-# Database setup
+# Database path
 DB_PATH = os.environ.get('DB_PATH', 'battlebottle.db')
 
+# Groq API configuration
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
+GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
+
 def get_db():
+    """Get database connection"""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    """Initialize the database with required tables."""
+    """Initialize database tables"""
     conn = get_db()
-    conn.executescript('''
+    cursor = conn.cursor()
+    
+    # Simulations table - stores all battle data
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS simulations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT,
-            map_id TEXT NOT NULL,
-            enemy_type TEXT NOT NULL,
+            map TEXT,
+            enemy TEXT,
             budget INTEGER,
             spent INTEGER,
             result TEXT,
-            survival_rate REAL,
-            kill_efficiency REAL,
-            battle_duration INTEGER,
-            cost_per_kill REAL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        );
-        
-        CREATE TABLE IF NOT EXISTS deployments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            simulation_id INTEGER,
-            unit_id TEXT,
-            unit_name TEXT,
-            unit_category TEXT,
-            unit_cost INTEGER,
-            start_x REAL,
-            start_y REAL,
-            survived INTEGER,
-            kills INTEGER,
-            damage_dealt REAL,
-            FOREIGN KEY (simulation_id) REFERENCES simulations(id)
-        );
-        
-        CREATE TABLE IF NOT EXISTS strategy_patterns (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            map_id TEXT,
-            enemy_type TEXT,
-            pattern_hash TEXT UNIQUE,
-            unit_composition TEXT,
-            avg_win_rate REAL,
-            sample_count INTEGER,
-            avg_cost_efficiency REAL,
-            last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
-        );
-        
-        CREATE INDEX IF NOT EXISTS idx_sim_map_enemy ON simulations(map_id, enemy_type, result);
-        CREATE INDEX IF NOT EXISTS idx_patterns ON strategy_patterns(map_id, enemy_type, avg_win_rate DESC);
+            timer INTEGER,
+            allies TEXT,
+            enemies TEXT,
+            initial_positions TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
     ''')
+    
+    # Aggregated stats table for quick lookups
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS scenario_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            map TEXT,
+            enemy TEXT,
+            budget_tier TEXT,
+            total_battles INTEGER DEFAULT 0,
+            victories INTEGER DEFAULT 0,
+            avg_time REAL DEFAULT 0,
+            best_compositions TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(map, enemy, budget_tier)
+        )
+    ''')
+    
     conn.commit()
     conn.close()
 
 # Initialize database on startup
 init_db()
 
+def get_budget_tier(budget):
+    """Categorize budget into tiers for aggregation"""
+    if budget < 1000000:
+        return 'low'
+    elif budget < 3000000:
+        return 'medium'
+    elif budget < 5000000:
+        return 'high'
+    else:
+        return 'unlimited'
 
-@app.route('/api/health', methods=['GET'])
-def health():
-    """Health check endpoint."""
-    return jsonify({'status': 'ok', 'service': 'BattleBottle AI Flywheel'})
+def call_groq_llama(prompt, max_tokens=500):
+    """Call Groq API with Llama model for tactical analysis"""
+    if not GROQ_API_KEY:
+        return None
+    
+    import urllib.request
+    import urllib.error
+    
+    headers = {
+        'Authorization': f'Bearer {GROQ_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+    
+    data = json.dumps({
+        'model': 'llama-3.1-70b-versatile',
+        'messages': [
+            {
+                'role': 'system',
+                'content': '''You are a tactical AI advisor for BattleBottle, a military drone warfare simulator. 
+Analyze battle data and provide concise, actionable tactical recommendations.
+Focus on: unit composition, deployment positioning, and strategic priorities.
+Keep responses brief and structured. Use military terminology appropriately.
+Format recommendations as JSON when requested.'''
+            },
+            {
+                'role': 'user',
+                'content': prompt
+            }
+        ],
+        'max_tokens': max_tokens,
+        'temperature': 0.7
+    }).encode('utf-8')
+    
+    try:
+        req = urllib.request.Request(GROQ_API_URL, data=data, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            return result['choices'][0]['message']['content']
+    except Exception as e:
+        print(f'[Groq API Error] {e}')
+        return None
 
+def generate_ai_recommendations(map_name, enemy_type, budget, historical_data):
+    """Generate AI-powered recommendations using Llama"""
+    
+    # Build context from historical data
+    if historical_data:
+        wins = [d for d in historical_data if d['result'] == 'victory']
+        losses = [d for d in historical_data if d['result'] == 'defeat']
+        win_rate = len(wins) / len(historical_data) * 100 if historical_data else 0
+        
+        # Analyze winning compositions
+        winning_units = {}
+        for win in wins:
+            allies = json.loads(win['allies']) if isinstance(win['allies'], str) else win['allies']
+            for ally in allies:
+                name = ally.get('name', 'Unknown')
+                if name not in winning_units:
+                    winning_units[name] = {'count': 0, 'total_kills': 0, 'total_damage': 0}
+                winning_units[name]['count'] += 1
+                winning_units[name]['total_kills'] += ally.get('kills', 0)
+                winning_units[name]['total_damage'] += ally.get('damageDealt', 0)
+        
+        # Sort by effectiveness
+        unit_effectiveness = sorted(
+            winning_units.items(),
+            key=lambda x: x[1]['total_kills'] / max(1, x[1]['count']),
+            reverse=True
+        )
+        
+        context = f"""
+Historical battle data for {map_name} vs {enemy_type}:
+- Total battles: {len(historical_data)}
+- Win rate: {win_rate:.1f}%
+- Budget range: ${budget:,}
+
+Most effective units in winning battles:
+{chr(10).join([f"- {name}: {stats['count']} deployments, {stats['total_kills']} total kills" for name, stats in unit_effectiveness[:5]])}
+
+Analyze this data and provide tactical recommendations in JSON format:
+{{
+    "specific_units": [
+        {{"name": "unit_name", "count": number, "reason": "brief reason"}}
+    ],
+    "deployment_zones": {{
+        "recon": {{"x": percent, "y": percent, "description": "positioning advice"}},
+        "attack": {{"x": percent, "y": percent, "description": "positioning advice"}},
+        "defense": {{"x": percent, "y": percent, "description": "positioning advice"}}
+    }},
+    "tactical_notes": ["key insight 1", "key insight 2"],
+    "priority_targets": ["target type 1", "target type 2"]
+}}
+"""
+    else:
+        context = f"""
+New scenario with no historical data:
+- Map: {map_name}
+- Enemy: {enemy_type}
+- Budget: ${budget:,}
+
+Provide baseline tactical recommendations for a drone warfare engagement.
+Consider typical enemy compositions and terrain factors.
+Return JSON format:
+{{
+    "specific_units": [
+        {{"name": "unit_name", "count": number, "reason": "brief reason"}}
+    ],
+    "deployment_zones": {{
+        "recon": {{"x": percent, "y": percent, "description": "positioning advice"}},
+        "attack": {{"x": percent, "y": percent, "description": "positioning advice"}}
+    }},
+    "tactical_notes": ["key insight 1"],
+    "priority_targets": ["target type 1"]
+}}
+"""
+    
+    llama_response = call_groq_llama(context, max_tokens=600)
+    
+    if llama_response:
+        try:
+            # Extract JSON from response
+            json_start = llama_response.find('{')
+            json_end = llama_response.rfind('}') + 1
+            if json_start >= 0 and json_end > json_start:
+                ai_recs = json.loads(llama_response[json_start:json_end])
+                return ai_recs
+        except json.JSONDecodeError:
+            print(f'[AI] Failed to parse Llama response as JSON')
+    
+    return None
+
+def generate_post_battle_feedback(battle_data):
+    """Generate AI feedback after a battle using Llama"""
+    
+    allies = battle_data.get('allies', [])
+    result = battle_data.get('result', 'unknown')
+    map_name = battle_data.get('map', 'unknown')
+    enemy_type = battle_data.get('enemy', 'unknown')
+    budget = battle_data.get('budget', 0)
+    spent = battle_data.get('spent', 0)
+    timer = battle_data.get('timer', 0)
+    
+    # Calculate stats
+    total_allies = len(allies)
+    surviving_allies = sum(1 for a in allies if a.get('hp', 0) > 0)
+    total_kills = sum(a.get('kills', 0) for a in allies)
+    total_damage = sum(a.get('damageDealt', 0) for a in allies)
+    
+    # Categorize units
+    recon_count = sum(1 for a in allies if a.get('cat') == 'recon')
+    attack_count = sum(1 for a in allies if a.get('cat') == 'attack')
+    defense_count = sum(1 for a in allies if a.get('cat') == 'defense')
+    equip_count = sum(1 for a in allies if a.get('cat') == 'equip')
+    
+    prompt = f"""
+Analyze this completed battle and provide tactical feedback:
+
+BATTLE SUMMARY:
+- Map: {map_name}
+- Enemy: {enemy_type}
+- Result: {result.upper()}
+- Battle time: {timer} simulation seconds
+
+DEPLOYMENT:
+- Budget: ${budget:,} | Spent: ${spent:,}
+- Units deployed: {total_allies} (Recon: {recon_count}, Attack: {attack_count}, Defense: {defense_count}, Equipment: {equip_count})
+- Surviving: {surviving_allies}/{total_allies}
+- Total kills: {total_kills}
+
+UNIT PERFORMANCE:
+{chr(10).join([f"- {a.get('name', 'Unknown')}: {a.get('kills', 0)} kills, {a.get('damageDealt', 0):.0f} damage, {'SURVIVED' if a.get('hp', 0) > 0 else 'DESTROYED'}" for a in allies])}
+
+Provide tactical feedback in JSON:
+{{
+    "overall_assessment": "brief assessment",
+    "strengths": ["what went well"],
+    "weaknesses": ["what could improve"],
+    "specific_advice": ["actionable tip 1", "actionable tip 2"],
+    "recommended_changes": [
+        {{"unit": "unit_name", "action": "add/remove/reposition", "reason": "why"}}
+    ]
+}}
+"""
+    
+    llama_response = call_groq_llama(prompt, max_tokens=700)
+    
+    if llama_response:
+        try:
+            json_start = llama_response.find('{')
+            json_end = llama_response.rfind('}') + 1
+            if json_start >= 0 and json_end > json_start:
+                return json.loads(llama_response[json_start:json_end])
+        except json.JSONDecodeError:
+            print(f'[AI] Failed to parse post-battle feedback as JSON')
+    
+    return None
 
 @app.route('/api/submit', methods=['POST'])
 def submit_simulation():
-    """
-    Receive simulation data after a battle completes.
-    
-    Expected payload:
-    {
-        "session_id": "uuid",
-        "map": "canary_wharf",
-        "enemy": "army",
-        "budget": 2000000,
-        "spent": 850000,
-        "result": "victory" | "defeat",
-        "timer": 180,
-        "allies": [
-            {
-                "id": "a1", "name": "MQ-9 Reaper", "cat": "attack",
-                "cost": 32000000, "x": 50, "y": 85, "hp": 80, "maxHp": 80,
-                "kills": 3, "damageDealt": 300
-            }
-        ],
-        "enemies": [
-            {"id": "e1", "name": "INFANTRY", "hp": 0, "maxHp": 100}
-        ],
-        "initialPositions": {
-            "a1": {"x": 50, "y": 85}
-        }
-    }
-    """
+    """Submit a completed simulation to the database"""
     try:
         data = request.json
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
         
         conn = get_db()
         cursor = conn.cursor()
         
-        # Calculate metrics
-        allies = data.get('allies', [])
-        enemies = data.get('enemies', [])
-        initial_pos = data.get('initialPositions', {})
-        
-        alive_allies = sum(1 for a in allies if a.get('hp', 0) > 0)
-        total_allies = len(allies)
-        survival_rate = (alive_allies / total_allies * 100) if total_allies > 0 else 0
-        
-        killed_enemies = sum(1 for e in enemies if e.get('hp', 0) <= 0)
-        total_enemies = len(enemies)
-        
-        spent = data.get('spent', 0)
-        cost_per_kill = (spent / killed_enemies) if killed_enemies > 0 else 0
-        
-        attack_units = sum(1 for a in allies if a.get('cat') == 'attack')
-        kill_efficiency = (killed_enemies / attack_units) if attack_units > 0 else 0
-        
-        # Insert simulation record
+        # Store simulation
         cursor.execute('''
             INSERT INTO simulations 
-            (session_id, map_id, enemy_type, budget, spent, result, 
-             survival_rate, kill_efficiency, battle_duration, cost_per_kill)
+            (session_id, map, enemy, budget, spent, result, timer, allies, enemies, initial_positions)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
-            data.get('session_id'),
-            data.get('map'),
-            data.get('enemy'),
-            data.get('budget'),
-            spent,
-            data.get('result'),
-            survival_rate,
-            kill_efficiency,
+            data.get('session_id', ''),
+            data.get('map', ''),
+            data.get('enemy', ''),
+            data.get('budget', 0),
+            data.get('spent', 0),
+            data.get('result', ''),
             data.get('timer', 0),
-            cost_per_kill
+            json.dumps(data.get('allies', [])),
+            json.dumps(data.get('enemies', [])),
+            json.dumps(data.get('initialPositions', {}))
         ))
         
         sim_id = cursor.lastrowid
         
-        # Insert deployment records
-        for ally in allies:
-            unit_id = ally.get('id')
-            init_x = initial_pos.get(unit_id, {}).get('x', ally.get('x', 50))
-            init_y = initial_pos.get(unit_id, {}).get('y', ally.get('y', 85))
-            
-            cursor.execute('''
-                INSERT INTO deployments 
-                (simulation_id, unit_id, unit_name, unit_category, unit_cost,
-                 start_x, start_y, survived, kills, damage_dealt)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                sim_id,
-                ally.get('id'),
-                ally.get('name'),
-                ally.get('cat'),
-                ally.get('cost', 0),
-                init_x,
-                init_y,
-                1 if ally.get('hp', 0) > 0 else 0,
-                ally.get('kills', 0),
-                ally.get('damageDealt', 0)
-            ))
+        # Update aggregated stats
+        budget_tier = get_budget_tier(data.get('budget', 0))
+        map_name = data.get('map', '')
+        enemy_type = data.get('enemy', '')
+        
+        cursor.execute('''
+            INSERT INTO scenario_stats (map, enemy, budget_tier, total_battles, victories)
+            VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(map, enemy, budget_tier) 
+            DO UPDATE SET 
+                total_battles = total_battles + 1,
+                victories = victories + ?,
+                updated_at = CURRENT_TIMESTAMP
+        ''', (
+            map_name,
+            enemy_type,
+            budget_tier,
+            1 if data.get('result') == 'victory' else 0,
+            1 if data.get('result') == 'victory' else 0
+        ))
         
         conn.commit()
-        
-        # Update strategy patterns
-        update_patterns(conn, data.get('map'), data.get('enemy'))
-        
         conn.close()
+        
+        # Generate post-battle AI feedback
+        ai_feedback = generate_post_battle_feedback(data)
         
         return jsonify({
             'success': True,
             'simulation_id': sim_id,
-            'message': 'Simulation data recorded'
+            'message': 'Simulation recorded',
+            'ai_feedback': ai_feedback
+        })
+        
+    except Exception as e:
+        print(f'[Submit Error] {e}')
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/recommend', methods=['POST'])
+def get_recommendations():
+    """Get AI-powered tactical recommendations"""
+    try:
+        data = request.json
+        map_name = data.get('map', '')
+        enemy_type = data.get('enemy', '')
+        budget = data.get('budget', 2000000)
+        budget_tier = get_budget_tier(budget)
+        
+        conn = get_db()
+        cursor = conn.cursor()
+        
+        # Get historical data for this scenario
+        cursor.execute('''
+            SELECT * FROM simulations 
+            WHERE map = ? AND enemy = ?
+            ORDER BY created_at DESC
+            LIMIT 50
+        ''', (map_name, enemy_type))
+        
+        historical = [dict(row) for row in cursor.fetchall()]
+        
+        # Get aggregated stats
+        cursor.execute('''
+            SELECT * FROM scenario_stats
+            WHERE map = ? AND enemy = ? AND budget_tier = ?
+        ''', (map_name, enemy_type, budget_tier))
+        
+        stats = cursor.fetchone()
+        conn.close()
+        
+        data_points = len(historical)
+        overall_win_rate = 0
+        
+        if stats:
+            total = stats['total_battles']
+            wins = stats['victories']
+            overall_win_rate = round((wins / total) * 100) if total > 0 else 0
+        
+        # Generate AI recommendations using Llama
+        ai_recs = generate_ai_recommendations(map_name, enemy_type, budget, historical)
+        
+        # Build response
+        response = {
+            'data_points': data_points,
+            'overall_win_rate': overall_win_rate,
+            'ai_enhanced': ai_recs is not None
+        }
+        
+        if ai_recs:
+            # Merge AI recommendations
+            response['specific_units'] = ai_recs.get('specific_units', [])
+            response['deployment_zones'] = ai_recs.get('deployment_zones', {})
+            response['tactical_notes'] = ai_recs.get('tactical_notes', [])
+            response['priority_targets'] = ai_recs.get('priority_targets', [])
+        else:
+            # Fallback to rule-based recommendations
+            response['specific_units'] = get_fallback_units(enemy_type, budget)
+            response['deployment_zones'] = get_fallback_positions(map_name)
+            response['tactical_notes'] = get_fallback_notes(enemy_type)
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        print(f'[Recommend Error] {e}')
+        return jsonify({'data_points': 0, 'error': str(e)}), 500
+
+@app.route('/api/feedback', methods=['POST'])
+def get_ai_feedback():
+    """Get detailed AI feedback for a completed battle"""
+    try:
+        data = request.json
+        feedback = generate_post_battle_feedback(data)
+        
+        if feedback:
+            return jsonify({
+                'success': True,
+                'feedback': feedback
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Could not generate AI feedback'
+            })
+            
+    except Exception as e:
+        print(f'[Feedback Error] {e}')
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/stats', methods=['GET'])
+def get_global_stats():
+    """Get global statistics for the data flywheel"""
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT COUNT(*) as total FROM simulations')
+        total_sims = cursor.fetchone()['total']
+        
+        cursor.execute('SELECT COUNT(*) as wins FROM simulations WHERE result = "victory"')
+        total_wins = cursor.fetchone()['wins']
+        
+        cursor.execute('SELECT COUNT(DISTINCT session_id) as players FROM simulations')
+        unique_players = cursor.fetchone()['players']
+        
+        conn.close()
+        
+        return jsonify({
+            'total_simulations': total_sims,
+            'total_victories': total_wins,
+            'global_win_rate': round((total_wins / total_sims) * 100) if total_sims > 0 else 0,
+            'unique_players': unique_players,
+            'ai_enabled': bool(GROQ_API_KEY)
         })
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-
-def update_patterns(conn, map_id, enemy_type):
-    """Analyze recent simulations and update winning patterns."""
-    cursor = conn.cursor()
-    
-    # Get recent simulations for this map/enemy combo
-    cursor.execute('''
-        SELECT s.id, s.result, s.survival_rate, s.cost_per_kill,
-               GROUP_CONCAT(d.unit_category || ':' || d.unit_name) as composition
-        FROM simulations s
-        JOIN deployments d ON d.simulation_id = s.id
-        WHERE s.map_id = ? AND s.enemy_type = ?
-        GROUP BY s.id
-        ORDER BY s.timestamp DESC
-        LIMIT 100
-    ''', (map_id, enemy_type))
-    
-    sims = cursor.fetchall()
-    
-    # Group by unit composition and calculate win rates
-    compositions = defaultdict(lambda: {'wins': 0, 'total': 0, 'costs': []})
-    
-    for sim in sims:
-        comp = sim['composition']
-        compositions[comp]['total'] += 1
-        if sim['result'] == 'victory':
-            compositions[comp]['wins'] += 1
-        if sim['cost_per_kill'] and sim['cost_per_kill'] > 0:
-            compositions[comp]['costs'].append(sim['cost_per_kill'])
-    
-    # Store patterns with good win rates
-    for comp, stats in compositions.items():
-        if stats['total'] >= 3:  # Need at least 3 samples
-            win_rate = stats['wins'] / stats['total']
-            avg_cost = statistics.mean(stats['costs']) if stats['costs'] else 0
-            pattern_hash = f"{map_id}:{enemy_type}:{comp}"
-            
-            cursor.execute('''
-                INSERT INTO strategy_patterns 
-                (map_id, enemy_type, pattern_hash, unit_composition, 
-                 avg_win_rate, sample_count, avg_cost_efficiency, last_updated)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(pattern_hash) DO UPDATE SET
-                    avg_win_rate = excluded.avg_win_rate,
-                    sample_count = excluded.sample_count,
-                    avg_cost_efficiency = excluded.avg_cost_efficiency,
-                    last_updated = excluded.last_updated
-            ''', (
-                map_id, enemy_type, pattern_hash, comp,
-                win_rate, stats['total'], avg_cost, datetime.now()
-            ))
-    
-    conn.commit()
-
-
-@app.route('/api/recommend', methods=['POST'])
-def get_recommendations():
-    """
-    Get AI-powered recommendations for a given scenario.
-    
-    Expected payload:
-    {
-        "map": "canary_wharf",
-        "enemy": "army",
-        "budget": 2000000
-    }
-    
-    Returns quantitative recommendations based on winning patterns.
-    """
-    try:
-        data = request.json
-        map_id = data.get('map')
-        enemy_type = data.get('enemy')
-        budget = data.get('budget', 2000000)
-        
-        conn = get_db()
-        cursor = conn.cursor()
-        
-        # Get best performing strategies for this scenario
-        cursor.execute('''
-            SELECT unit_composition, avg_win_rate, sample_count, avg_cost_efficiency
-            FROM strategy_patterns
-            WHERE map_id = ? AND enemy_type = ?
-            ORDER BY avg_win_rate DESC, sample_count DESC
-            LIMIT 5
-        ''', (map_id, enemy_type))
-        
-        patterns = cursor.fetchall()
-        
-        # Get overall statistics for this scenario
-        cursor.execute('''
-            SELECT 
-                COUNT(*) as total_sims,
-                SUM(CASE WHEN result = 'victory' THEN 1 ELSE 0 END) as victories,
-                AVG(survival_rate) as avg_survival,
-                AVG(cost_per_kill) as avg_cost_per_kill
-            FROM simulations
-            WHERE map_id = ? AND enemy_type = ?
-        ''', (map_id, enemy_type))
-        
-        stats = cursor.fetchone()
-        
-        # Get most successful unit types
-        cursor.execute('''
-            SELECT 
-                d.unit_name,
-                d.unit_category,
-                d.unit_cost,
-                COUNT(*) as usage_count,
-                AVG(d.survived) as survival_rate,
-                AVG(d.kills) as avg_kills
-            FROM deployments d
-            JOIN simulations s ON s.id = d.simulation_id
-            WHERE s.map_id = ? AND s.enemy_type = ? AND s.result = 'victory'
-            GROUP BY d.unit_name
-            ORDER BY usage_count DESC, avg_kills DESC
-            LIMIT 10
-        ''', (map_id, enemy_type))
-        
-        winning_units = cursor.fetchall()
-        
-        # Get optimal deployment positions
-        cursor.execute('''
-            SELECT 
-                d.unit_category,
-                AVG(d.start_x) as avg_x,
-                AVG(d.start_y) as avg_y,
-                COUNT(*) as sample_size
-            FROM deployments d
-            JOIN simulations s ON s.id = d.simulation_id
-            WHERE s.map_id = ? AND s.enemy_type = ? AND s.result = 'victory'
-            AND d.survived = 1
-            GROUP BY d.unit_category
-        ''', (map_id, enemy_type))
-        
-        positions = cursor.fetchall()
-        
-        conn.close()
-        
-        # Build recommendations
-        recommendations = build_recommendations(
-            map_id, enemy_type, budget, 
-            patterns, stats, winning_units, positions
-        )
-        
-        return jsonify(recommendations)
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-def build_recommendations(map_id, enemy_type, budget, patterns, stats, winning_units, positions):
-    """Build structured recommendations from the data."""
-    
-    # Parse winning compositions and count specific units
-    unit_counts = defaultdict(list)
-    specific_unit_counts = defaultdict(int)
-    
-    if patterns:
-        for pattern in patterns:
-            if pattern['unit_composition']:
-                units = pattern['unit_composition'].split(',')
-                for unit in units:
-                    parts = unit.split(':')
-                    if len(parts) == 2:
-                        cat, name = parts
-                        unit_counts[cat].append(name)
-                        specific_unit_counts[name] += 1
-    
-    # Calculate recommended composition
-    recon_count = len([u for u in unit_counts.get('recon', [])])
-    attack_count = len([u for u in unit_counts.get('attack', [])])
-    defense_count = len([u for u in unit_counts.get('defense', [])])
-    equip_count = len([u for u in unit_counts.get('equip', [])])
-    
-    # Normalize to typical deployment
-    total = recon_count + attack_count + defense_count + equip_count
-    if total > 0:
-        rec_recon = max(1, round(recon_count / total * 6))
-        rec_attack = max(2, round(attack_count / total * 6))
-        rec_defense = round(defense_count / total * 6)
-        rec_equip = round(equip_count / total * 6)
-    else:
-        # Default recommendations if no data
-        rec_recon = 2
-        rec_attack = 3
-        rec_defense = 1 if enemy_type == 'army' else 0
-        rec_equip = 1
-    
-    # Get specific unit recommendations with counts
-    recommended_units = []
-    if winning_units:
-        for unit in winning_units[:6]:
-            recommended_units.append({
-                'name': unit['unit_name'],
-                'category': unit['unit_category'],
-                'cost': unit['unit_cost'],
-                'win_rate': round(unit['survival_rate'] * 100, 1),
-                'avg_kills': round(unit['avg_kills'], 1),
-                'times_used': specific_unit_counts.get(unit['unit_name'], 1)
-            })
-    
-    # Build specific unit deployment list (e.g., "2x Switchblade 300")
-    unit_deploy_list = []
-    seen_units = set()
-    for unit in recommended_units:
-        if unit['name'] not in seen_units:
-            count = max(1, round(unit['times_used'] / max(1, stats['total_sims'] if stats else 1) * 2))
-            if count > 0:
-                unit_deploy_list.append({
-                    'name': unit['name'],
-                    'count': count,
-                    'category': unit['category'],
-                    'cost': unit['cost']
-                })
-                seen_units.add(unit['name'])
-    
-    # Sort by category order: recon first, then attack, defense, equip
-    cat_order = {'recon': 0, 'attack': 1, 'defense': 2, 'equip': 3}
-    unit_deploy_list.sort(key=lambda x: cat_order.get(x['category'], 99))
-    
-    # Get position recommendations with descriptive locations
-    position_recs = {}
-    if positions:
-        for pos in positions:
-            x = round(pos['avg_x'], 1)
-            y = round(pos['avg_y'], 1)
-            
-            # Convert coordinates to descriptive positions
-            x_desc = 'left flank' if x < 35 else 'right flank' if x > 65 else 'center'
-            y_desc = 'forward' if y < 70 else 'rear' if y > 85 else 'mid-field'
-            
-            position_recs[pos['unit_category']] = {
-                'x': x,
-                'y': y,
-                'description': f"{x_desc}, {y_desc}",
-                'sample_size': pos['sample_size']
-            }
-    
-    # Add default positions if missing
-    default_positions = {
-        'recon': {'x': 50, 'y': 80, 'description': 'center, rear'},
-        'attack': {'x': 50, 'y': 88, 'description': 'center, deployment zone'},
-        'defense': {'x': 50, 'y': 85, 'description': 'center, mid-field'},
-        'equip': {'x': 50, 'y': 95, 'description': 'center, rear safe zone'}
-    }
-    for cat, pos in default_positions.items():
-        if cat not in position_recs:
-            position_recs[cat] = {**pos, 'sample_size': 0}
-    
-    # Calculate confidence based on data volume
-    total_sims = stats['total_sims'] if stats and stats['total_sims'] else 0
-    confidence = min(100, total_sims * 5)  # 100% confidence at 20+ simulations
-    
-    win_rate = 0
-    if stats and stats['total_sims'] and stats['victories']:
-        win_rate = round(stats['victories'] / stats['total_sims'] * 100, 1)
-    
-    # Build human-readable deployment string
-    deploy_str = ', '.join([f"{u['count']}x {u['name']}" for u in unit_deploy_list[:4]])
-    
-    return {
-        'scenario': {
-            'map': map_id,
-            'enemy': enemy_type,
-            'budget': budget
-        },
-        'data_points': total_sims,
-        'confidence': confidence,
-        'overall_win_rate': win_rate,
-        'recommended_composition': {
-            'recon': rec_recon,
-            'attack': rec_attack,
-            'defense': rec_defense,
-            'equipment': rec_equip,
-            'explanation': f"Based on {total_sims} simulations, deploy {rec_recon} recon, {rec_attack} attack, {rec_defense} defense units."
-        },
-        'specific_units': unit_deploy_list[:5],
-        'deploy_summary': deploy_str if deploy_str else None,
-        'top_units': recommended_units,
-        'deployment_zones': position_recs,
-        'tactical_notes': generate_tactical_notes(map_id, enemy_type, stats)
-    }
-
-
-def generate_tactical_notes(map_id, enemy_type, stats):
-    """Generate tactical notes based on scenario."""
-    notes = []
-    
-    # Map-specific advice
-    map_notes = {
-        'canary_wharf': 'Urban high-rise environment. MQ-9 Reaper effective against infantry in buildings.',
-        'gaza': 'Dense urban combat. Spread units to avoid grouped losses. Use recon to spot building entrances.',
-        'afghanistan': 'Rural terrain with limited cover. Fast attack drones recommended.',
-        'open_field': 'Minimal cover. Aggressive positioning viable. Speed advantage critical.',
-        'minneapolis': 'Grid layout allows flanking. Use jammers to control corridors.'
-    }
-    
-    enemy_notes = {
-        'guerrilla': 'Erratic movement patterns. Maintain recon coverage. Budget for attrition.',
-        'army': 'Heavy drone presence. Counter-UAS essential. Balanced approach works.',
-        'mercenary': 'Fast elite infantry. Prioritize kill speed over economy. No enemy drones.'
-    }
-    
-    if map_id in map_notes:
-        notes.append(map_notes[map_id])
-    if enemy_type in enemy_notes:
-        notes.append(enemy_notes[enemy_type])
-    
-    # Data-driven notes
-    if stats and stats['avg_cost_per_kill']:
-        avg_cost = stats['avg_cost_per_kill']
-        if avg_cost < 50000:
-            notes.append(f"Cost efficiency is strong at ${avg_cost:,.0f}/kill. FPV drones performing well.")
-        elif avg_cost > 150000:
-            notes.append(f"High cost per kill (${avg_cost:,.0f}). Consider cheaper units like Switchblade 300.")
-    
-    return notes
-
-
-@app.route('/api/recommend/llm', methods=['POST'])
-def get_llm_recommendations():
-    """
-    Get natural language recommendations using Llama via Groq.
-    Requires GROQ_API_KEY environment variable.
-    """
-    try:
-        import requests as http_req
-        
-        groq_key = os.environ.get('GROQ_API_KEY')
-        if not groq_key:
-            return jsonify({
-                'error': 'GROQ_API_KEY not configured',
-                'fallback': 'Use /api/recommend for data-driven recommendations'
-            }), 400
-        
-        data = request.json
-        map_id = data.get('map')
-        enemy_type = data.get('enemy')
-        budget = data.get('budget', 2000000)
-        
-        # Get structured recommendations first
-        conn = get_db()
-        cursor = conn.cursor()
-        
-        # Get winning patterns
-        cursor.execute('''
-            SELECT unit_composition, avg_win_rate, sample_count
-            FROM strategy_patterns
-            WHERE map_id = ? AND enemy_type = ?
-            ORDER BY avg_win_rate DESC
-            LIMIT 3
-        ''', (map_id, enemy_type))
-        patterns = cursor.fetchall()
-        
-        # Get statistics
-        cursor.execute('''
-            SELECT COUNT(*) as total, 
-                   AVG(CASE WHEN result='victory' THEN 1.0 ELSE 0.0 END) as win_rate
-            FROM simulations WHERE map_id = ? AND enemy_type = ?
-        ''', (map_id, enemy_type))
-        stats = cursor.fetchone()
-        
-        conn.close()
-        
-        # Build context for LLM
-        patterns_text = ""
-        if patterns:
-            patterns_text = "Top winning compositions:\n"
-            for p in patterns:
-                patterns_text += f"- {p['unit_composition']} (Win rate: {p['avg_win_rate']*100:.0f}%, {p['sample_count']} battles)\n"
-        
-        prompt = f"""You are a military drone tactics advisor for the BattleBottle training simulator.
-
-SCENARIO:
-- Map: {map_id.replace('_', ' ').title()}
-- Enemy Type: {enemy_type.title()}
-- Budget: ${budget:,}
-
-DATA FROM {stats['total'] if stats else 0} PLAYER SIMULATIONS:
-- Overall win rate: {(stats['win_rate']*100) if stats and stats['win_rate'] else 0:.0f}%
-{patterns_text}
-
-AVAILABLE UNITS:
-Recon: RQ-11 Raven ($35k), PD-100 Black Hornet ($195k), Skydio X2D ($25k), ScanEagle ($100k)
-Attack: Switchblade 300 ($6k, kamikaze), Switchblade 600 ($55k, kamikaze), FPV Drone ($500, kamikaze), MQ-9 Reaper ($32M, precision)
-Defense: Coyote Block 3 ($28k), Anduril Anvil ($75k), DroneHunter F700 ($120k), Skywall Patrol ($45k)
-Equipment: Silent Archer jammer ($350k), DroneGun ($32k), Orion Tether ($85k), MPU5 Radio ($18k)
-
-Based on the player data, provide SPECIFIC quantitative recommendations:
-1. Exact unit composition (e.g., "Deploy 2x RQ-11 Raven, 3x Switchblade 300, 1x Coyote Block 3")
-2. Deployment positions as percentages (e.g., "Recon at x=30%, y=75%")
-3. Priority target order
-4. Budget allocation breakdown
-
-Keep response under 200 words. Be direct and tactical."""
-
-        # Call Groq API
-        response = http_req.post(
-            'https://api.groq.com/openai/v1/chat/completions',
-            headers={
-                'Authorization': f'Bearer {groq_key}',
-                'Content-Type': 'application/json'
-            },
-            json={
-                'model': 'llama-3.1-8b-instant',
-                'messages': [
-                    {'role': 'system', 'content': 'You are a concise military tactics AI. Give specific, quantitative recommendations.'},
-                    {'role': 'user', 'content': prompt}
-                ],
-                'max_tokens': 500,
-                'temperature': 0.7
-            },
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            llm_text = result['choices'][0]['message']['content']
-            
-            return jsonify({
-                'scenario': {'map': map_id, 'enemy': enemy_type, 'budget': budget},
-                'data_points': stats['total'] if stats else 0,
-                'recommendation': llm_text,
-                'model': 'llama-3.1-8b-instant'
-            })
-        else:
-            return jsonify({
-                'error': f'Groq API error: {response.status_code}',
-                'fallback': 'Use /api/recommend for data-driven recommendations'
-            }), 500
-            
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/stats', methods=['GET'])
-def get_global_stats():
-    """Get global statistics about the data flywheel."""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT COUNT(*) FROM simulations')
-    total_sims = cursor.fetchone()[0]
-    
-    cursor.execute('SELECT COUNT(DISTINCT session_id) FROM simulations')
-    unique_players = cursor.fetchone()[0]
-    
-    cursor.execute('''
-        SELECT map_id, enemy_type, COUNT(*) as count,
-               AVG(CASE WHEN result='victory' THEN 1.0 ELSE 0.0 END) as win_rate
-        FROM simulations
-        GROUP BY map_id, enemy_type
-        ORDER BY count DESC
-    ''')
-    scenario_stats = [dict(row) for row in cursor.fetchall()]
-    
-    conn.close()
-    
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
     return jsonify({
-        'total_simulations': total_sims,
-        'unique_sessions': unique_players,
-        'scenarios': scenario_stats,
-        'flywheel_status': 'active' if total_sims > 10 else 'warming_up'
+        'status': 'healthy',
+        'ai_enabled': bool(GROQ_API_KEY),
+        'timestamp': datetime.now().isoformat()
     })
 
+def get_fallback_units(enemy_type, budget):
+    """Rule-based unit recommendations when AI is unavailable"""
+    units = []
+    
+    if budget >= 500000:
+        units.append({'name': 'MQ-1C Gray Eagle', 'count': 1, 'reason': 'Reliable recon platform'})
+    
+    if enemy_type in ['guerrilla', 'militia']:
+        units.append({'name': 'Switchblade 300', 'count': 3, 'reason': 'Effective against infantry'})
+    else:
+        units.append({'name': 'MQ-9 Reaper', 'count': 2, 'reason': 'Multi-role strike capability'})
+    
+    if budget >= 1000000:
+        units.append({'name': 'RQ-4 Global Hawk', 'count': 1, 'reason': 'Wide area surveillance'})
+    
+    return units
+
+def get_fallback_positions(map_name):
+    """Rule-based positioning recommendations"""
+    return {
+        'recon': {'x': 50, 'y': 85, 'description': 'Center rear for maximum coverage'},
+        'attack': {'x': 30, 'y': 90, 'description': 'Left flank approach'},
+        'defense': {'x': 70, 'y': 90, 'description': 'Right side protection'}
+    }
+
+def get_fallback_notes(enemy_type):
+    """Rule-based tactical notes"""
+    notes = {
+        'army': ['Focus on counter-drone operations', 'Expect organized resistance'],
+        'guerrilla': ['Watch for ambush positions', 'Infantry will use cover effectively'],
+        'militia': ['Mixed threat level', 'Recon before engaging']
+    }
+    return notes.get(enemy_type, ['Assess threat before committing forces'])
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=os.environ.get('DEBUG', 'false').lower() == 'true')
+    app.run(host='0.0.0.0', port=port, debug=False)
