@@ -1,8 +1,6 @@
 """
 BattleBottle AI Backend
 Flask server with Groq/Llama integration for tactical recommendations
-Supports both standard missions and custom defense mode
-Deployed on Render
 """
 
 from flask import Flask, request, jsonify
@@ -13,18 +11,14 @@ import json
 from datetime import datetime
 
 app = Flask(__name__)
-CORS(app, origins=['*'], supports_credentials=True)
+CORS(app)
 
-# Database path - use /tmp for Render (ephemeral storage)
-# For persistent storage, use a database service like PostgreSQL
-DB_PATH = os.environ.get('DB_PATH', '/tmp/battlebottle.db')
+# Database path
+DB_PATH = os.environ.get('DB_PATH', 'battlebottle.db')
 
 # Groq API configuration
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
-
-# Base simulation count (shown in UI as starting point)
-BASE_SIMULATION_COUNT = 120
 
 def get_db():
     """Get database connection"""
@@ -37,7 +31,7 @@ def init_db():
     conn = get_db()
     cursor = conn.cursor()
     
-    # Simulations table - stores all battle data including custom defense
+    # Simulations table - stores all battle data
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS simulations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,8 +45,6 @@ def init_db():
             allies TEXT,
             enemies TEXT,
             initial_positions TEXT,
-            mode TEXT DEFAULT 'standard',
-            custom_map_name TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -70,21 +62,6 @@ def init_db():
             best_compositions TEXT,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(map, enemy, budget_tier)
-        )
-    ''')
-    
-    # Custom defense stats table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS custom_defense_stats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            map TEXT,
-            enemy TEXT,
-            total_tests INTEGER DEFAULT 0,
-            defenses_held INTEGER DEFAULT 0,
-            avg_units_used REAL DEFAULT 0,
-            best_unit_compositions TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(map, enemy)
         )
     ''')
     
@@ -108,6 +85,7 @@ def get_budget_tier(budget):
 def call_groq_llama(prompt, max_tokens=500):
     """Call Groq API with Llama model for tactical analysis"""
     if not GROQ_API_KEY:
+        print('[Groq API] No API key configured')
         return None
     
     import urllib.request
@@ -119,7 +97,7 @@ def call_groq_llama(prompt, max_tokens=500):
     }
     
     data = json.dumps({
-        'model': 'llama-3.1-70b-versatile',
+        'model': 'llama-3.3-70b-versatile',
         'messages': [
             {
                 'role': 'system',
@@ -142,7 +120,11 @@ Format recommendations as JSON when requested.'''
         req = urllib.request.Request(GROQ_API_URL, data=data, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as response:
             result = json.loads(response.read().decode('utf-8'))
+            print('[Groq API] Success')
             return result['choices'][0]['message']['content']
+    except urllib.error.HTTPError as e:
+        print(f'[Groq API Error] HTTP Error {e.code}: {e.reason}')
+        return None
     except Exception as e:
         print(f'[Groq API Error] {e}')
         return None
@@ -246,8 +228,6 @@ def generate_post_battle_feedback(battle_data):
     budget = battle_data.get('budget', 0)
     spent = battle_data.get('spent', 0)
     timer = battle_data.get('timer', 0)
-    mode = battle_data.get('mode', 'standard')
-    custom_map_name = battle_data.get('customMapName', '')
     
     # Calculate stats
     total_allies = len(allies)
@@ -256,57 +236,37 @@ def generate_post_battle_feedback(battle_data):
     total_damage = sum(a.get('damageDealt', 0) for a in allies)
     
     # Categorize units
-    recon_count = sum(1 for a in allies if a.get('cat') == 'recon')
-    attack_count = sum(1 for a in allies if a.get('cat') == 'attack')
-    defense_count = sum(1 for a in allies if a.get('cat') == 'defense')
-    equip_count = sum(1 for a in allies if a.get('cat') == 'equip')
-    
-    # Customize prompt based on mode
-    if mode == 'custom_defense':
-        mode_context = f"""
-MODE: CUSTOM DEFENSE TEST
-Custom Map Name: {custom_map_name or 'Unnamed'}
-This was a defense test where the player placed units to defend against attackers.
-Focus feedback on defensive positioning and unit placement strategy.
-"""
-        result_text = "DEFENSE HELD" if result == 'victory' else "DEFENSE BREACHED"
-    else:
-        mode_context = "MODE: STANDARD MISSION"
-        result_text = result.upper()
+    unit_summary = {}
+    for ally in allies:
+        cat = ally.get('cat', 'unknown')
+        if cat not in unit_summary:
+            unit_summary[cat] = {'count': 0, 'survived': 0, 'kills': 0}
+        unit_summary[cat]['count'] += 1
+        if ally.get('hp', 0) > 0:
+            unit_summary[cat]['survived'] += 1
+        unit_summary[cat]['kills'] += ally.get('kills', 0)
     
     prompt = f"""
-Analyze this completed battle and provide tactical feedback:
-
-{mode_context}
-
-BATTLE SUMMARY:
-- Map: {map_name}
-- Enemy: {enemy_type}
-- Result: {result_text}
-- Battle time: {timer} simulation seconds
-
-DEPLOYMENT:
-- Budget: ${budget:,} | Spent: ${spent:,}
-- Units deployed: {total_allies} (Recon: {recon_count}, Attack: {attack_count}, Defense: {defense_count}, Equipment: {equip_count})
-- Surviving: {surviving_allies}/{total_allies}
+Battle completed on {map_name} vs {enemy_type}:
+- Result: {result.upper()}
+- Budget: ${budget:,} / Spent: ${spent:,}
+- Battle duration: {timer} seconds
+- Allies deployed: {total_allies}, Survived: {surviving_allies}
 - Total kills: {total_kills}
 
-UNIT PERFORMANCE:
-{chr(10).join([f"- {a.get('name', 'Unknown')}: {a.get('kills', 0)} kills, {a.get('damageDealt', 0):.0f} damage, {'SURVIVED' if a.get('hp', 0) > 0 else 'DESTROYED'}" for a in allies[:10]])}
+Unit breakdown:
+{chr(10).join([f"- {cat}: {stats['count']} deployed, {stats['survived']} survived, {stats['kills']} kills" for cat, stats in unit_summary.items()])}
 
-Provide tactical feedback in JSON:
+Provide brief tactical feedback in JSON format:
 {{
-    "overall_assessment": "brief assessment",
-    "strengths": ["what went well"],
-    "weaknesses": ["what could improve"],
-    "specific_advice": ["actionable tip 1", "actionable tip 2"],
-    "recommended_changes": [
-        {{"unit": "unit_name", "action": "add/remove/reposition", "reason": "why"}}
-    ]
+    "overall_assessment": "one sentence summary",
+    "what_worked": ["point 1", "point 2"],
+    "what_to_improve": ["point 1", "point 2"],
+    "suggested_changes": ["specific suggestion 1", "specific suggestion 2"]
 }}
 """
     
-    llama_response = call_groq_llama(prompt, max_tokens=700)
+    llama_response = call_groq_llama(prompt, max_tokens=400)
     
     if llama_response:
         try:
@@ -315,85 +275,20 @@ Provide tactical feedback in JSON:
             if json_start >= 0 and json_end > json_start:
                 return json.loads(llama_response[json_start:json_end])
         except json.JSONDecodeError:
-            print(f'[AI] Failed to parse post-battle feedback as JSON')
+            print('[AI] Failed to parse feedback as JSON')
     
     return None
 
-
-def generate_defense_feedback(battle_data):
-    """Generate specific feedback for custom defense tests"""
-    
-    allies = battle_data.get('allies', [])
-    result = battle_data.get('result', 'unknown')
-    map_name = battle_data.get('map', 'unknown')
-    enemy_type = battle_data.get('enemy', 'unknown')
-    
-    # Analyze unit positions
-    positions_by_cat = {'recon': [], 'attack': [], 'defense': [], 'equip': []}
-    for ally in allies:
-        cat = ally.get('cat', 'attack')
-        if cat in positions_by_cat:
-            positions_by_cat[cat].append({
-                'name': ally.get('name'),
-                'x': ally.get('initialX', ally.get('x', 50)),
-                'y': ally.get('initialY', ally.get('y', 50)),
-                'survived': ally.get('hp', 0) > 0,
-                'kills': ally.get('kills', 0)
-            })
-    
-    prompt = f"""
-Analyze this CUSTOM DEFENSE placement and provide specific positioning feedback:
-
-MAP: {map_name}
-ENEMY TYPE: {enemy_type}
-RESULT: {"DEFENSE HELD" if result == 'victory' else "DEFENSE BREACHED"}
-
-UNIT POSITIONS BY CATEGORY:
-Recon Units: {json.dumps(positions_by_cat['recon'])}
-Attack Units: {json.dumps(positions_by_cat['attack'])}
-Defense Units: {json.dumps(positions_by_cat['defense'])}
-Equipment: {json.dumps(positions_by_cat['equip'])}
-
-Provide defense improvement feedback in JSON:
-{{
-    "defense_rating": "A/B/C/D/F",
-    "position_analysis": "analysis of current positioning",
-    "vulnerabilities": ["weak point 1", "weak point 2"],
-    "repositioning_suggestions": [
-        {{"unit_type": "type", "current_position": "description", "suggested_position": "description", "reason": "why"}}
-    ],
-    "additional_units_needed": [
-        {{"unit_name": "name", "suggested_position": "description", "reason": "why"}}
-    ],
-    "key_improvements": ["improvement 1", "improvement 2"]
-}}
-"""
-    
-    llama_response = call_groq_llama(prompt, max_tokens=800)
-    
-    if llama_response:
-        try:
-            json_start = llama_response.find('{')
-            json_end = llama_response.rfind('}') + 1
-            if json_start >= 0 and json_end > json_start:
-                return json.loads(llama_response[json_start:json_end])
-        except json.JSONDecodeError:
-            print(f'[AI] Failed to parse defense feedback as JSON')
-    
-    return None
-
-
-@app.route('/', methods=['GET'])
+@app.route('/')
 def index():
     """Root endpoint"""
     return jsonify({
         'service': 'BattleBottle AI Backend',
         'version': '1.1.0',
         'status': 'running',
-        'features': ['standard_missions', 'custom_defense', 'ai_feedback'],
-        'endpoints': ['/api/submit', '/api/recommend', '/api/feedback', '/api/defense-feedback', '/api/stats', '/health']
+        'endpoints': ['/api/submit', '/api/recommend', '/api/feedback', '/api/defense-feedback', '/api/stats', '/health'],
+        'features': ['standard_missions', 'custom_defense', 'ai_feedback']
     })
-
 
 @app.route('/api/submit', methods=['POST'])
 def submit_simulation():
@@ -404,14 +299,11 @@ def submit_simulation():
         conn = get_db()
         cursor = conn.cursor()
         
-        mode = data.get('mode', 'standard')
-        custom_map_name = data.get('customMapName', '')
-        
         # Store simulation
         cursor.execute('''
             INSERT INTO simulations 
-            (session_id, map, enemy, budget, spent, result, timer, allies, enemies, initial_positions, mode, custom_map_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (session_id, map, enemy, budget, spent, result, timer, allies, enemies, initial_positions)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             data.get('session_id', ''),
             data.get('map', ''),
@@ -422,9 +314,7 @@ def submit_simulation():
             data.get('timer', 0),
             json.dumps(data.get('allies', [])),
             json.dumps(data.get('enemies', [])),
-            json.dumps(data.get('initialPositions', {})),
-            mode,
-            custom_map_name
+            json.dumps(data.get('initialPositions', {}))
         ))
         
         sim_id = cursor.lastrowid
@@ -450,51 +340,22 @@ def submit_simulation():
             1 if data.get('result') == 'victory' else 0
         ))
         
-        # Update custom defense stats if applicable
-        if mode == 'custom_defense':
-            num_units = len(data.get('allies', []))
-            cursor.execute('''
-                INSERT INTO custom_defense_stats (map, enemy, total_tests, defenses_held, avg_units_used)
-                VALUES (?, ?, 1, ?, ?)
-                ON CONFLICT(map, enemy) 
-                DO UPDATE SET 
-                    total_tests = total_tests + 1,
-                    defenses_held = defenses_held + ?,
-                    avg_units_used = (avg_units_used * total_tests + ?) / (total_tests + 1),
-                    updated_at = CURRENT_TIMESTAMP
-            ''', (
-                map_name,
-                enemy_type,
-                1 if data.get('result') == 'victory' else 0,
-                num_units,
-                1 if data.get('result') == 'victory' else 0,
-                num_units
-            ))
-        
         conn.commit()
         conn.close()
         
         # Generate post-battle AI feedback
         ai_feedback = generate_post_battle_feedback(data)
         
-        # Generate additional defense-specific feedback for custom defense mode
-        defense_feedback = None
-        if mode == 'custom_defense':
-            defense_feedback = generate_defense_feedback(data)
-        
         return jsonify({
             'success': True,
             'simulation_id': sim_id,
             'message': 'Simulation recorded',
-            'mode': mode,
-            'ai_feedback': ai_feedback,
-            'defense_feedback': defense_feedback
+            'ai_feedback': ai_feedback
         })
         
     except Exception as e:
         print(f'[Submit Error] {e}')
         return jsonify({'success': False, 'error': str(e)}), 500
-
 
 @app.route('/api/recommend', methods=['POST'])
 def get_recommendations():
@@ -509,7 +370,7 @@ def get_recommendations():
         conn = get_db()
         cursor = conn.cursor()
         
-        # Get historical data for this scenario (both standard and custom defense)
+        # Get historical data for this scenario
         cursor.execute('''
             SELECT * FROM simulations 
             WHERE map = ? AND enemy = ?
@@ -543,8 +404,7 @@ def get_recommendations():
         response = {
             'data_points': data_points,
             'overall_win_rate': overall_win_rate,
-            'ai_enhanced': ai_recs is not None,
-            'simulation_count': BASE_SIMULATION_COUNT + (data_points * 3)
+            'ai_enhanced': ai_recs is not None
         }
         
         if ai_recs:
@@ -564,7 +424,6 @@ def get_recommendations():
     except Exception as e:
         print(f'[Recommend Error] {e}')
         return jsonify({'data_points': 0, 'error': str(e)}), 500
-
 
 @app.route('/api/feedback', methods=['POST'])
 def get_ai_feedback():
@@ -588,18 +447,22 @@ def get_ai_feedback():
         print(f'[Feedback Error] {e}')
         return jsonify({'success': False, 'error': str(e)}), 500
 
-
 @app.route('/api/defense-feedback', methods=['POST'])
 def get_defense_feedback():
-    """Get specific feedback for custom defense placements"""
+    """Get AI feedback specifically for custom defense scenarios"""
     try:
         data = request.json
-        feedback = generate_defense_feedback(data)
+        
+        # Add defense-specific context
+        data['mode'] = 'custom_defense'
+        
+        feedback = generate_post_battle_feedback(data)
         
         if feedback:
             return jsonify({
                 'success': True,
-                'feedback': feedback
+                'feedback': feedback,
+                'mode': 'defense'
             })
         else:
             return jsonify({
@@ -610,7 +473,6 @@ def get_defense_feedback():
     except Exception as e:
         print(f'[Defense Feedback Error] {e}')
         return jsonify({'success': False, 'error': str(e)}), 500
-
 
 @app.route('/api/stats', methods=['GET'])
 def get_global_stats():
@@ -628,13 +490,6 @@ def get_global_stats():
         cursor.execute('SELECT COUNT(DISTINCT session_id) as players FROM simulations')
         unique_players = cursor.fetchone()['players']
         
-        # Custom defense stats
-        cursor.execute('SELECT COUNT(*) as total FROM simulations WHERE mode = "custom_defense"')
-        custom_defense_tests = cursor.fetchone()['total']
-        
-        cursor.execute('SELECT COUNT(*) as held FROM simulations WHERE mode = "custom_defense" AND result = "victory"')
-        defenses_held = cursor.fetchone()['held']
-        
         conn.close()
         
         return jsonify({
@@ -642,16 +497,11 @@ def get_global_stats():
             'total_victories': total_wins,
             'global_win_rate': round((total_wins / total_sims) * 100) if total_sims > 0 else 0,
             'unique_players': unique_players,
-            'custom_defense_tests': custom_defense_tests,
-            'defenses_held': defenses_held,
-            'defense_success_rate': round((defenses_held / custom_defense_tests) * 100) if custom_defense_tests > 0 else 0,
-            'ai_enabled': bool(GROQ_API_KEY),
-            'base_simulation_count': BASE_SIMULATION_COUNT
+            'ai_enabled': bool(GROQ_API_KEY)
         })
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -659,34 +509,29 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'ai_enabled': bool(GROQ_API_KEY),
-        'version': '1.1.0',
-        'features': ['standard', 'custom_defense'],
+        'model': 'llama-3.3-70b-versatile',
         'timestamp': datetime.now().isoformat()
     })
-
 
 def get_fallback_units(enemy_type, budget):
     """Rule-based unit recommendations when AI is unavailable"""
     units = []
     
-    if budget >= 500000:
-        units.append({'name': 'RQ-11 Raven', 'count': 2, 'reason': 'Reliable recon platform'})
-    
     if enemy_type == 'guerrilla':
-        units.append({'name': 'Custom FPV Drone', 'count': 15, 'reason': 'Effective against infantry swarms'})
-        units.append({'name': 'Switchblade 300', 'count': 8, 'reason': 'Precision anti-infantry'})
+        units.append({'name': 'RQ-11 Raven', 'count': 2, 'reason': 'Recon for scattered infantry'})
+        units.append({'name': 'Switchblade 300', 'count': 4, 'reason': 'Effective against infantry'})
+        units.append({'name': 'Custom FPV Drone', 'count': 3, 'reason': 'Cheap area denial'})
     elif enemy_type == 'mercenary':
-        units.append({'name': 'Raytheon Coyote', 'count': 5, 'reason': 'Counter fast targets'})
-        units.append({'name': 'Switchblade 300', 'count': 10, 'reason': 'Rapid elimination'})
-        units.append({'name': 'Custom FPV Drone', 'count': 8, 'reason': 'Backup firepower'})
-    else:
-        units.append({'name': 'Anduril Anvil', 'count': 4, 'reason': 'Counter-drone capability'})
-        units.append({'name': 'Switchblade 600', 'count': 5, 'reason': 'Heavy strike power'})
-        units.append({'name': 'Switchblade 300', 'count': 6, 'reason': 'Anti-infantry support'})
-        units.append({'name': 'Custom FPV Drone', 'count': 12, 'reason': 'Swarm assault'})
+        units.append({'name': 'PD-100 Black Hornet', 'count': 2, 'reason': 'Stealthy recon vs elite forces'})
+        units.append({'name': 'Switchblade 600', 'count': 2, 'reason': 'Anti-armor capability'})
+        units.append({'name': 'Coyote Block 3', 'count': 2, 'reason': 'Counter-drone defense'})
+    else:  # army
+        units.append({'name': 'Boeing ScanEagle', 'count': 1, 'reason': 'Long-range ISR'})
+        units.append({'name': 'MQ-9 Reaper', 'count': 1, 'reason': 'Precision strike capability'})
+        units.append({'name': 'Switchblade 600', 'count': 3, 'reason': 'Anti-armor loitering munition'})
+        units.append({'name': 'Anduril Anvil', 'count': 2, 'reason': 'Counter-UAS protection'})
     
     return units
-
 
 def get_fallback_positions(map_name):
     """Rule-based positioning recommendations"""
@@ -696,16 +541,14 @@ def get_fallback_positions(map_name):
         'defense': {'x': 70, 'y': 90, 'description': 'Right side protection'}
     }
 
-
 def get_fallback_notes(enemy_type):
     """Rule-based tactical notes"""
     notes = {
-        'army': ['Focus on counter-drone operations first', 'Expect organized resistance with drone support'],
-        'guerrilla': ['Spread FPV swarm wide to catch scattered infantry', 'Infantry will use cover effectively'],
-        'mercenary': ['Defense line MUST intercept fast movers early', 'Expect aggressive flanking maneuvers']
+        'army': ['Focus on counter-drone operations', 'Expect organized resistance', 'Use terrain for cover'],
+        'guerrilla': ['Watch for ambush positions', 'Infantry will use buildings', 'Spread recon wide'],
+        'mercenary': ['Fast and aggressive enemies', 'Prioritize eliminating scouts', 'Defend flanks']
     }
     return notes.get(enemy_type, ['Assess threat before committing forces'])
-
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
