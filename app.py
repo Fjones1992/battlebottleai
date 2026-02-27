@@ -509,7 +509,7 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'ai_enabled': bool(GROQ_API_KEY),
-        'model': 'llama-3.3-70b-versatile',
+        'model': 'llama-3.1-8b-instant',
         'timestamp': datetime.now().isoformat()
     })
 
