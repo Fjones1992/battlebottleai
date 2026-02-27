@@ -1,6 +1,6 @@
 """
 BattleBottle AI Backend
-Flask server with Groq/Llama integration for tactical recommendations
+Flask server with Fireworks AI/Llama integration for tactical recommendations
 """
 
 from flask import Flask, request, jsonify
@@ -16,9 +16,9 @@ CORS(app)
 # Database path
 DB_PATH = os.environ.get('DB_PATH', 'battlebottle.db')
 
-# Groq API configuration
-GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
-GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
+# Fireworks AI API configuration
+FIREWORKS_API_KEY = os.environ.get('FIREWORKS_API_KEY', '')
+FIREWORKS_API_URL = 'https://api.fireworks.ai/inference/v1/chat/completions'
 
 def get_db():
     """Get database connection"""
@@ -31,7 +31,6 @@ def init_db():
     conn = get_db()
     cursor = conn.cursor()
     
-    # Simulations table - stores all battle data
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS simulations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,7 +48,6 @@ def init_db():
         )
     ''')
     
-    # Aggregated stats table for quick lookups
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS scenario_stats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,11 +66,9 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Initialize database on startup
 init_db()
 
 def get_budget_tier(budget):
-    """Categorize budget into tiers for aggregation"""
     if budget < 1000000:
         return 'low'
     elif budget < 3000000:
@@ -82,22 +78,22 @@ def get_budget_tier(budget):
     else:
         return 'unlimited'
 
-def call_groq_llama(prompt, max_tokens=500):
-    """Call Groq API with Llama model for tactical analysis"""
-    if not GROQ_API_KEY:
-        print('[Groq API] No API key configured')
+def call_llama(prompt, max_tokens=500):
+    """Call Fireworks AI API with Llama model"""
+    if not FIREWORKS_API_KEY:
+        print('[Fireworks AI] No API key configured')
         return None
     
     import urllib.request
     import urllib.error
     
     headers = {
-        'Authorization': f'Bearer {GROQ_API_KEY}',
+        'Authorization': f'Bearer {FIREWORKS_API_KEY}',
         'Content-Type': 'application/json'
     }
     
     data = json.dumps({
-        'model': 'llama-3.1-8b-instant',
+        'model': 'accounts/fireworks/models/llama-v3p1-70b-instruct',
         'messages': [
             {
                 'role': 'system',
@@ -117,28 +113,25 @@ Format recommendations as JSON when requested.'''
     }).encode('utf-8')
     
     try:
-        req = urllib.request.Request(GROQ_API_URL, data=data, headers=headers)
+        req = urllib.request.Request(FIREWORKS_API_URL, data=data, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as response:
             result = json.loads(response.read().decode('utf-8'))
-            print('[Groq API] Success')
+            print('[Fireworks AI] Success')
             return result['choices'][0]['message']['content']
     except urllib.error.HTTPError as e:
-        print(f'[Groq API Error] HTTP Error {e.code}: {e.reason}')
+        print(f'[Fireworks AI Error] HTTP Error {e.code}: {e.reason}')
         return None
     except Exception as e:
-        print(f'[Groq API Error] {e}')
+        print(f'[Fireworks AI Error] {e}')
         return None
 
 def generate_ai_recommendations(map_name, enemy_type, budget, historical_data):
     """Generate AI-powered recommendations using Llama"""
     
-    # Build context from historical data
     if historical_data:
         wins = [d for d in historical_data if d['result'] == 'victory']
-        losses = [d for d in historical_data if d['result'] == 'defeat']
         win_rate = len(wins) / len(historical_data) * 100 if historical_data else 0
         
-        # Analyze winning compositions
         winning_units = {}
         for win in wins:
             allies = json.loads(win['allies']) if isinstance(win['allies'], str) else win['allies']
@@ -150,7 +143,6 @@ def generate_ai_recommendations(map_name, enemy_type, budget, historical_data):
                 winning_units[name]['total_kills'] += ally.get('kills', 0)
                 winning_units[name]['total_damage'] += ally.get('damageDealt', 0)
         
-        # Sort by effectiveness
         unit_effectiveness = sorted(
             winning_units.items(),
             key=lambda x: x[1]['total_kills'] / max(1, x[1]['count']),
@@ -203,23 +195,22 @@ Return JSON format:
 }}
 """
     
-    llama_response = call_groq_llama(context, max_tokens=600)
+    llama_response = call_llama(context, max_tokens=600)
     
     if llama_response:
         try:
-            # Extract JSON from response
             json_start = llama_response.find('{')
             json_end = llama_response.rfind('}') + 1
             if json_start >= 0 and json_end > json_start:
                 ai_recs = json.loads(llama_response[json_start:json_end])
                 return ai_recs
         except json.JSONDecodeError:
-            print(f'[AI] Failed to parse Llama response as JSON')
+            print('[AI] Failed to parse Llama response as JSON')
     
     return None
 
 def generate_post_battle_feedback(battle_data):
-    """Generate AI feedback after a battle using Llama"""
+    """Generate AI feedback after a battle"""
     
     allies = battle_data.get('allies', [])
     result = battle_data.get('result', 'unknown')
@@ -229,13 +220,10 @@ def generate_post_battle_feedback(battle_data):
     spent = battle_data.get('spent', 0)
     timer = battle_data.get('timer', 0)
     
-    # Calculate stats
     total_allies = len(allies)
     surviving_allies = sum(1 for a in allies if a.get('hp', 0) > 0)
     total_kills = sum(a.get('kills', 0) for a in allies)
-    total_damage = sum(a.get('damageDealt', 0) for a in allies)
     
-    # Categorize units
     unit_summary = {}
     for ally in allies:
         cat = ally.get('cat', 'unknown')
@@ -266,7 +254,7 @@ Provide brief tactical feedback in JSON format:
 }}
 """
     
-    llama_response = call_groq_llama(prompt, max_tokens=400)
+    llama_response = call_llama(prompt, max_tokens=400)
     
     if llama_response:
         try:
@@ -281,25 +269,22 @@ Provide brief tactical feedback in JSON format:
 
 @app.route('/')
 def index():
-    """Root endpoint"""
     return jsonify({
         'service': 'BattleBottle AI Backend',
-        'version': '1.1.0',
+        'version': '1.2.0',
         'status': 'running',
-        'endpoints': ['/api/submit', '/api/recommend', '/api/feedback', '/api/defense-feedback', '/api/stats', '/health'],
-        'features': ['standard_missions', 'custom_defense', 'ai_feedback']
+        'ai_provider': 'Fireworks AI',
+        'endpoints': ['/api/submit', '/api/recommend', '/api/feedback', '/api/defense-feedback', '/api/stats', '/health']
     })
 
 @app.route('/api/submit', methods=['POST'])
 def submit_simulation():
-    """Submit a completed simulation to the database"""
     try:
         data = request.json
         
         conn = get_db()
         cursor = conn.cursor()
         
-        # Store simulation
         cursor.execute('''
             INSERT INTO simulations 
             (session_id, map, enemy, budget, spent, result, timer, allies, enemies, initial_positions)
@@ -319,7 +304,6 @@ def submit_simulation():
         
         sim_id = cursor.lastrowid
         
-        # Update aggregated stats
         budget_tier = get_budget_tier(data.get('budget', 0))
         map_name = data.get('map', '')
         enemy_type = data.get('enemy', '')
@@ -343,7 +327,6 @@ def submit_simulation():
         conn.commit()
         conn.close()
         
-        # Generate post-battle AI feedback
         ai_feedback = generate_post_battle_feedback(data)
         
         return jsonify({
@@ -359,7 +342,6 @@ def submit_simulation():
 
 @app.route('/api/recommend', methods=['POST'])
 def get_recommendations():
-    """Get AI-powered tactical recommendations"""
     try:
         data = request.json
         map_name = data.get('map', '')
@@ -370,7 +352,6 @@ def get_recommendations():
         conn = get_db()
         cursor = conn.cursor()
         
-        # Get historical data for this scenario
         cursor.execute('''
             SELECT * FROM simulations 
             WHERE map = ? AND enemy = ?
@@ -380,7 +361,6 @@ def get_recommendations():
         
         historical = [dict(row) for row in cursor.fetchall()]
         
-        # Get aggregated stats
         cursor.execute('''
             SELECT * FROM scenario_stats
             WHERE map = ? AND enemy = ? AND budget_tier = ?
@@ -397,10 +377,8 @@ def get_recommendations():
             wins = stats['victories']
             overall_win_rate = round((wins / total) * 100) if total > 0 else 0
         
-        # Generate AI recommendations using Llama
         ai_recs = generate_ai_recommendations(map_name, enemy_type, budget, historical)
         
-        # Build response
         response = {
             'data_points': data_points,
             'overall_win_rate': overall_win_rate,
@@ -408,13 +386,11 @@ def get_recommendations():
         }
         
         if ai_recs:
-            # Merge AI recommendations
             response['specific_units'] = ai_recs.get('specific_units', [])
             response['deployment_zones'] = ai_recs.get('deployment_zones', {})
             response['tactical_notes'] = ai_recs.get('tactical_notes', [])
             response['priority_targets'] = ai_recs.get('priority_targets', [])
         else:
-            # Fallback to rule-based recommendations
             response['specific_units'] = get_fallback_units(enemy_type, budget)
             response['deployment_zones'] = get_fallback_positions(map_name)
             response['tactical_notes'] = get_fallback_notes(enemy_type)
@@ -427,21 +403,14 @@ def get_recommendations():
 
 @app.route('/api/feedback', methods=['POST'])
 def get_ai_feedback():
-    """Get detailed AI feedback for a completed battle"""
     try:
         data = request.json
         feedback = generate_post_battle_feedback(data)
         
         if feedback:
-            return jsonify({
-                'success': True,
-                'feedback': feedback
-            })
+            return jsonify({'success': True, 'feedback': feedback})
         else:
-            return jsonify({
-                'success': False,
-                'error': 'Could not generate AI feedback'
-            })
+            return jsonify({'success': False, 'error': 'Could not generate AI feedback'})
             
     except Exception as e:
         print(f'[Feedback Error] {e}')
@@ -449,26 +418,15 @@ def get_ai_feedback():
 
 @app.route('/api/defense-feedback', methods=['POST'])
 def get_defense_feedback():
-    """Get AI feedback specifically for custom defense scenarios"""
     try:
         data = request.json
-        
-        # Add defense-specific context
         data['mode'] = 'custom_defense'
-        
         feedback = generate_post_battle_feedback(data)
         
         if feedback:
-            return jsonify({
-                'success': True,
-                'feedback': feedback,
-                'mode': 'defense'
-            })
+            return jsonify({'success': True, 'feedback': feedback, 'mode': 'defense'})
         else:
-            return jsonify({
-                'success': False,
-                'error': 'Could not generate defense feedback'
-            })
+            return jsonify({'success': False, 'error': 'Could not generate defense feedback'})
             
     except Exception as e:
         print(f'[Defense Feedback Error] {e}')
@@ -476,7 +434,6 @@ def get_defense_feedback():
 
 @app.route('/api/stats', methods=['GET'])
 def get_global_stats():
-    """Get global statistics for the data flywheel"""
     try:
         conn = get_db()
         cursor = conn.cursor()
@@ -497,7 +454,7 @@ def get_global_stats():
             'total_victories': total_wins,
             'global_win_rate': round((total_wins / total_sims) * 100) if total_sims > 0 else 0,
             'unique_players': unique_players,
-            'ai_enabled': bool(GROQ_API_KEY)
+            'ai_enabled': bool(FIREWORKS_API_KEY)
         })
         
     except Exception as e:
@@ -505,18 +462,16 @@ def get_global_stats():
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
-        'ai_enabled': bool(GROQ_API_KEY),
-        'model': 'llama-3.1-8b-instant',
+        'ai_enabled': bool(FIREWORKS_API_KEY),
+        'ai_provider': 'Fireworks AI',
+        'model': 'accounts/fireworks/models/llama-v3p1-70b-instruct',
         'timestamp': datetime.now().isoformat()
     })
 
 def get_fallback_units(enemy_type, budget):
-    """Rule-based unit recommendations when AI is unavailable"""
     units = []
-    
     if enemy_type == 'guerrilla':
         units.append({'name': 'RQ-11 Raven', 'count': 2, 'reason': 'Recon for scattered infantry'})
         units.append({'name': 'Switchblade 300', 'count': 4, 'reason': 'Effective against infantry'})
@@ -525,16 +480,14 @@ def get_fallback_units(enemy_type, budget):
         units.append({'name': 'PD-100 Black Hornet', 'count': 2, 'reason': 'Stealthy recon vs elite forces'})
         units.append({'name': 'Switchblade 600', 'count': 2, 'reason': 'Anti-armor capability'})
         units.append({'name': 'Coyote Block 3', 'count': 2, 'reason': 'Counter-drone defense'})
-    else:  # army
+    else:
         units.append({'name': 'Boeing ScanEagle', 'count': 1, 'reason': 'Long-range ISR'})
         units.append({'name': 'MQ-9 Reaper', 'count': 1, 'reason': 'Precision strike capability'})
         units.append({'name': 'Switchblade 600', 'count': 3, 'reason': 'Anti-armor loitering munition'})
         units.append({'name': 'Anduril Anvil', 'count': 2, 'reason': 'Counter-UAS protection'})
-    
     return units
 
 def get_fallback_positions(map_name):
-    """Rule-based positioning recommendations"""
     return {
         'recon': {'x': 50, 'y': 85, 'description': 'Center rear for maximum coverage'},
         'attack': {'x': 30, 'y': 90, 'description': 'Left flank approach'},
@@ -542,7 +495,6 @@ def get_fallback_positions(map_name):
     }
 
 def get_fallback_notes(enemy_type):
-    """Rule-based tactical notes"""
     notes = {
         'army': ['Focus on counter-drone operations', 'Expect organized resistance', 'Use terrain for cover'],
         'guerrilla': ['Watch for ambush positions', 'Infantry will use buildings', 'Spread recon wide'],
