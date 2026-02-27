@@ -93,7 +93,7 @@ def call_llama(prompt, max_tokens=500):
     }
     
     data = json.dumps({
-        'model': 'accounts/fireworks/models/llama-v3p1-70b-instruct',
+        'model': 'accounts/fireworks/models/llama-v3p1-8b-instruct',
         'messages': [
             {
                 'role': 'system',
@@ -466,7 +466,7 @@ def health_check():
         'status': 'healthy',
         'ai_enabled': bool(FIREWORKS_API_KEY),
         'ai_provider': 'Fireworks AI',
-        'model': 'accounts/fireworks/models/llama-v3p1-70b-instruct',
+        'model': 'accounts/fireworks/models/llama-v3p1-8b-instruct',
         'timestamp': datetime.now().isoformat()
     })
 
